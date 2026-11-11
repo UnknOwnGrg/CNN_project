@@ -152,3 +152,166 @@ def load_dataset_data():
         return None, None
 
     return  np.array(images, dtype='float32'),np.array(labels,dtype='float32')
+
+def train_cnn_model(epochs=15 , batch_size=4):
+    """Load the player dataset and trains the MobileNetV2 transfer model,logging stats in real-time."""
+    global _model_cache
+
+    # Write init status
+    with open(STATUS_PATH, 'w') as f:
+        json.dump({"status": "starting","current_epoch": 0,"total_epochs": epochs,"history": {}}, f)
+
+    X,y = load_dataset_data()
+    if X is None or len(X) < 3:
+        with open(STATUS_PATH, 'w') as f:
+            json.dump({"status": "failed", "error":"Not enough images in dataset. Please add images first"}, f)
+        return False
+
+    # Split into train and validation (80-20 split)
+    indices = np.arange(X.shape[0])
+    np.random.shuffle(indices)
+    X,y = X[indices], y[indices]
+
+    val_split = int(0.2 * len(X))
+    if val_split < 1:
+        # Ensures at least 1 validation image
+        val_split = 1
+
+    X_val, y_val = X[:val_split], y[:val_split]
+    X_train, y_train = X[val_split:], y[val_split:]
+
+    # Define and Train Model
+    model = create_model()
+
+    # Use real-time status callback to log metrics to JSON
+    status_callbcak = RealTimeStatsCallback(epochs)
+
+    print(f"Transfer training started: {len(X_train)} training samples, {len(X_val)} validation samples.")
+    model.fit(
+        X_train, y_train,
+        validation_data = (X_val, y_val),
+        epochs=epochs,
+        batch_size=batch_size,
+        callbacks=[status_callbcak],
+        verbose=1
+    )
+
+    # Save the model
+    model.save(MODEL_PATH)
+
+    # Update in-memory model cache
+    _model_cache = model
+
+    # Update final training status
+    if os.path.exists(STATUS_PATH):
+        with open(STATUS_PATH, 'r') as f:
+            data = json.load(f)
+    else:
+        data = {"history": {}}
+
+    data["status"] = "completed"
+    with open(STATUS_PATH, 'w') as f:
+        json.dump(data, f)
+
+    print("Training finished successfully. Model saved and cached.")
+
+    return True
+
+def run_inference(image_bytes):
+    """Runs prediction on custom image bytes. Returns list of dictionary predictions"""
+    model = get_model()
+    if model is None:
+        return{
+            "error": "Model not trained yet.Please train the transfer model first"
+        }
+
+    try:
+        # Load and preprocess image
+        img = Image.open(io.BytesIO(image_bytes))
+        img = img.convert('RGB')
+        img_resized = img.resize(IMG_SIZE)
+        img_arr = img_to_array(img_resized)
+        img_arr = tf.keras.applications.mobilenet_v2.preprocess_input(img_arr)
+        # Add batch dimension(1, 128, 128, 3)
+        img_arr = np.expand_dims(img_arr, axis=0)
+
+        # Predict
+        predictions = model.predict(img_arr)[0]
+
+        results = []
+
+        for idx,score in enumerate(predictions):
+            results.append({
+                'class': CLASSES[idx],
+                'confidence': float(score)
+            })
+
+        # Sort predictions by confidence desc
+        results = sorted(results, key=lambda x:x['confidence'], reverse=True)
+    except Exception as e:
+        return {"error": f"Error running inference : {str(e)}"}
+
+
+def extract_activation_maps(image_bytes):
+    """Extracts output activations of the first convolutional layer(16 filters) of the base MobileNetV2 Model. """
+    model = get_model()
+    if model is None:
+        return None
+
+    try:
+        # Preprocess input image
+        img= Image.open(io.BytesIO(image_bytes))
+        img= img.convert('RGB')
+        img_resized= img.resize(IMG_SIZE)
+        img_arr= img_to_array(img_resized)
+        img_arr= tf.keras.applications.mobilenet_v2.preprocess_input(img_arr)
+        img_arr= np.expand_dims(img_arr, axis=0)
+
+        # Isolate base MobileNetV2 model (layer 0)
+        base_model = model.layers[0]
+
+        # Find the first Conv2D layer inside the base model
+        first_conv = None
+        for layer in base_model.layers:
+            if isinstance(layer, tf.keras.layers.Conv2D):
+                first_conv = layer
+                break
+
+        if first_conv is None:
+            print("Could not find any Conv2D layer in base model.")
+            return None
+
+        # Create intermediate activation model
+        activation_model = tf.keras.Model(inputs=base_model.input, outputs=first_conv.output)
+        activations = activation_model.predict(img_arr)[0]
+
+        # Export each of the first 16 filters as a base64 encoded image
+        maps_base64 = []
+        for i in range(16):
+            feat_map = activations[:,:,i]
+
+            # Normalize to 0-255 range
+            f_min , f_max = feat_map.min(), feat_map.max()
+            if f_max - f_min > 0:
+                feat_map = 255 * (feat_map - f_min) /  (f_max - f_min)
+            feat_map = feat_map.astype('uint8')
+
+            # Convert map to colorful image using colormap (Viridis gives a stunning scientific lookup)
+            colored_map = cm.viridis(feat_map)
+            colored_map = (colored_map[:,:,:3] * 255).astype('uint8')
+
+            # Create PIL image
+            pil_map = Image.fromarray(colored_map)
+            pil_map_resized = pil_map.resize((128, 128), Image.Resampling.NEAREST)
+
+            # Save to memory as PNG
+            buffer = io.BytesIO()
+            pil_map_resized.save(buffer,format="PNG")
+            img_str = base64.b64encode(buffer.getvalue()).decode('utf-8')
+            maps_base64.append(img_str)
+
+        return maps_base64
+    except Exception as e:
+        print(f"Error extracting activation maps: {e}")
+        return None
+
