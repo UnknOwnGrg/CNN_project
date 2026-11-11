@@ -52,3 +52,103 @@ class RealTimeStatsCallback(Callback):
                     "val_loss": [], "val_accuracy": []
                 }
             }, f)
+
+    def on_epoch_end(self, epoch, logs=None):
+        logs = logs or {}
+        try:
+            # Read Existing History
+            if os.path.exists(STATUS_PATH):
+                with open(STATUS_PATH, 'r') as f:
+                    data = json.load(f)
+            else:
+                data = {"history":
+                            {"loss": [],
+                             "accuracy": [],
+                             "val_loss": [],
+                             "val_accuracy": []
+                             }
+                        }
+
+            data['status'] = 'training'
+            data['current_epoch'] = epoch + 1
+            data['total_epochs'] = self.total_epochs
+
+            # Append new metrics
+            data['history']['loss'].append(float(logs.get('loss', 0.0)))
+            data['history']['accuracy'].append(float(logs.get('accuracy', 0.0)))
+            data['history']['val_loss'].append(float(logs.get('val_loss', 0.0)))
+            data['history']['val_accuracy'].append(float(logs.get('val_accuracy', 0.0)))
+
+            with open(STATUS_PATH, 'w') as f:
+                json.dump(data, f)
+        except Exception as e:
+            print(f"Error writing training status: {e}")
+
+
+# Model Creation by using open source model MobileNetV2
+def create_model():
+    """Builds a MobileNetV2-based transfer learning model for Barcelona footballers classification."""
+    # Loading a pre-trained MobileNetV2 base (excluding classification head)
+    base_model = tf.keras.applications.MobileNetV2(
+        input_shape=(128, 128, 3),
+        include_top=False,
+        weights='imagenet'
+    )
+
+    # Freeze pre-trained layers
+    base_model.trainable = False
+
+    model = Sequential([
+        base_model,
+        GlobalAveragePooling2D(name='global_pooling'),
+        Dense(64, activation='relu', name='dense_1'),
+        Dropout(0.5, name='dropout'),
+        Dense(len(CLASSES), activation='softmax',name='output')
+    ])
+
+
+    model.compile(
+        optimizer = tf.keras.optimizers.Adam(learning_rate=0.01),
+        loss='categorical_crossentropy',
+        metrics=['accuracy']
+    )
+
+    return model
+
+
+# Simply to load the dataset which had been passed by the User's
+def load_dataset_data():
+    """Loads images from dataset directory, pre-processes them for MobileNetV2"""
+
+    images = []
+    labels = []
+
+    for class_idx, class_name in enumerate(CLASSES):
+        class_folder = os.path.join(DATASET_DIR, class_name)
+        if not os.path.exists(class_folder):
+            continue
+
+        for filename in os.listdir(class_folder):
+            if not filename.lower().endswith(('.jpg', '.jpeg', '.png')):
+                continue
+            filepath = os.path.join(class_folder, filename)
+            try:
+                #     Load image , resize and convert to numpy array
+                img = load_img(filepath, target_size=IMG_SIZE)
+                img_arr = img_to_array(img)
+                # Preprocess for MobileNetV2 (scales pixels to [-1, 1])
+                img_arr = tf.keras.applications.mobilenet_v2.preprocess_input(img_arr)
+                images.append(img_arr)
+
+
+                # Make one-hot encoded label representation
+                label = np.zeros(len(CLASSES))
+                label[class_idx] = 1.0
+                labels.append(label)
+            except Exception as e:
+                print(f'Skipping corrupted image {filepath}: {e}')
+
+    if len(images) == 0:
+        return None, None
+
+    return  np.array(images, dtype='float32'),np.array(labels,dtype='float32')
